@@ -18,7 +18,10 @@ final class SupaBaseManager {
 
         self.client = SupabaseClient(
             supabaseURL: parsedURL,
-            supabaseKey: key
+            supabaseKey: key,
+            options: SupabaseClientOptions(
+                auth: .init(emitLocalSessionAsInitialSession: true)
+            )
         )
     }
 
