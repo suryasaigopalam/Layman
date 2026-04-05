@@ -297,7 +297,11 @@ private struct GeminiChatClient {
         Content: \(article.content ?? "N/A")
         """
 
-        let recent = history.suffix(8).map { item in
+        let recentHistory = history
+            .dropLast(
+                (history.last?.role == .user && history.last?.text == userMessage) ? 1 : 0
+            )
+        let recent = recentHistory.suffix(8).map { item in
             GeminiContent(
                 role: item.role == .user ? "user" : "model",
                 parts: [GeminiPart(text: item.text)]
@@ -332,21 +336,22 @@ private struct GeminiChatClient {
         )
 
         let decoded = try await performGenerate(requestBody: requestBody, apiKey: apiKey)
-        guard
-            let rawText = decoded.candidates.first?.content.parts.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-            !rawText.isEmpty
-        else {
+        guard let rawText = extractText(from: decoded) else {
             throw ChatError.emptyResponse
         }
 
         let cleanedText = normalizeReply(rawText)
         if isLowQualityReply(cleanedText) {
-            return try await regenerateCleanReply(
+            let repaired = try await regenerateCleanReply(
                 userMessage: userMessage,
                 article: article,
                 draftReply: cleanedText,
                 apiKey: apiKey
             )
+            if isLowQualityReply(repaired) {
+                return fallbackReply(article: article)
+            }
+            return repaired
         }
 
         return cleanedText
@@ -396,7 +401,7 @@ private struct GeminiChatClient {
         }
 
         let decoded = try JSONDecoder().decode(GeminiGenerateResponse.self, from: data)
-        guard let text = decoded.candidates.first?.content.parts.first?.text else {
+        guard let text = extractText(from: decoded) else {
             throw ChatError.emptyResponse
         }
 
@@ -404,12 +409,9 @@ private struct GeminiChatClient {
     }
 
     private func loadAPIKey() throws -> String {
-        if let fromEnvironment = ProcessInfo.processInfo.environment["GEMINI_API_KEY"], !fromEnvironment.isEmpty {
-            return fromEnvironment
-        }
-
-        if let fromInfo = Bundle.main.object(forInfoDictionaryKey: "GEMINI_API_KEY") as? String, !fromInfo.isEmpty {
-            return fromInfo
+        if let value = AppConfig.value(for: "GEMINI_API_KEY"),
+           !AppConfig.isUnresolvedBuildSetting(value) {
+            return value
         }
 
         throw ChatError.missingAPIKey
@@ -444,6 +446,7 @@ private struct GeminiChatClient {
                 Rewrite the draft into a clear layman answer.
                 Must be 1-2 complete sentences, no fragments, no bullets.
                 Keep between 14 and 40 words.
+                Keep it grounded in the provided article context.
                 Return plain text only.
                 """)]
             ),
@@ -452,6 +455,9 @@ private struct GeminiChatClient {
                     role: "user",
                     parts: [GeminiPart(text: """
                     Article title: \(article.title)
+                    Article source: \(article.source.name)
+                    Article description: \(article.description ?? "N/A")
+                    Article content: \(article.content ?? "N/A")
                     User question: \(userMessage)
                     Draft answer: \(draftReply)
                     """)]
@@ -465,13 +471,22 @@ private struct GeminiChatClient {
 
         let decoded = try await performGenerate(requestBody: repairRequest, apiKey: apiKey)
         guard
-            let repaired = decoded.candidates.first?.content.parts.first?.text,
+            let repaired = extractText(from: decoded),
             !repaired.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             throw ChatError.emptyResponse
         }
 
         return normalizeReply(repaired)
+    }
+
+    private func extractText(from response: GeminiGenerateResponse) -> String? {
+        let combined = response.candidates
+            .flatMap { $0.content.parts }
+            .compactMap(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return combined.isEmpty ? nil : combined
     }
 
     private func normalizeReply(_ text: String) -> String {
@@ -493,6 +508,15 @@ private struct GeminiChatClient {
         let words = text.split(whereSeparator: \.isWhitespace).count
         let hasSentenceEnd = text.contains(".") || text.contains("?") || text.contains("!")
         return words < 8 || !hasSentenceEnd
+    }
+
+    private func fallbackReply(article: Article) -> String {
+        let description = article.description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let description, !description.isEmpty {
+            return "In simple terms, this article says \(description)"
+        }
+
+        return "In simple terms, this article is about \(article.title), and the main point is that it can directly affect people depending on what happens next."
     }
 
     private func parseSuggestionText(_ text: String) -> [String] {

@@ -8,12 +8,14 @@ final class SupaBaseManager {
 
     init() {
         guard
-            let urlString = Bundle.main.object(forInfoDictionaryKey: "SUPABASE_URL") as? String,
+            let urlString = AppConfig.value(for: "SUPABASE_URL"),
+            !AppConfig.isUnresolvedBuildSetting(urlString),
             let parsedURL = URL(string: urlString),
-            let key = Bundle.main.object(forInfoDictionaryKey: "SUPABASE_ANON_KEY") as? String,
-            !key.isEmpty
+            parsedURL.host != nil,
+            let key = AppConfig.value(for: "SUPABASE_ANON_KEY"),
+            !AppConfig.isUnresolvedBuildSetting(key)
         else {
-            fatalError("Missing SUPABASE_URL or SUPABASE_ANON_KEY in Info.plist")
+            fatalError("Invalid SUPABASE_URL or SUPABASE_ANON_KEY. Verify Config.xcconfig is linked to your target and SUPABASE_URL uses https:/$()/... format.")
         }
 
         self.client = SupabaseClient(

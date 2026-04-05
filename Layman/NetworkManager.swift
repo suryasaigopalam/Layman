@@ -14,12 +14,9 @@ enum NetworkError: Error {
 
 class NetworkManager {
     private func loadAPIKey() throws -> String {
-        if let fromEnvironment = ProcessInfo.processInfo.environment["NEWS_API_KEY"], !fromEnvironment.isEmpty {
-            return fromEnvironment
-        }
-
-        if let fromInfo = Bundle.main.object(forInfoDictionaryKey: "NEWS_API_KEY") as? String, !fromInfo.isEmpty {
-            return fromInfo
+        if let value = AppConfig.value(for: "NEWS_API_KEY"),
+           !AppConfig.isUnresolvedBuildSetting(value) {
+            return value
         }
 
         throw NetworkError.missingApiKey
