@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 struct ChartView: View {
     @Environment(\.dismiss) private var dismiss
@@ -15,7 +18,7 @@ struct ChartView: View {
     @State private var isSending = false
     @State private var errorText: String?
 
-    private let apiClient = GeminiChatClient()
+    private let apiClient = OnDeviceChatClient()
 
     init(article: Article = .previewArticle) {
         self.article = article
@@ -286,207 +289,70 @@ private enum SuggestionBuilder {
     }
 }
 
-private struct GeminiChatClient {
+private struct OnDeviceChatClient {
+    #if canImport(FoundationModels)
+    private let model = SystemLanguageModel.default
+    #endif
+
     func sendMessage(userMessage: String, article: Article, history: [ChatMessage]) async throws -> String {
-        let apiKey = try loadAPIKey()
-
-        let context = """
-        Title: \(article.title)
-        Source: \(article.source.name)
-        Description: \(article.description ?? "N/A")
-        Content: \(article.content ?? "N/A")
-        """
-
-        let recentHistory = history
-            .dropLast(
-                (history.last?.role == .user && history.last?.text == userMessage) ? 1 : 0
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *), model.isAvailable {
+            let session = LanguageModelSession(
+                model: model,
+                instructions: """
+                """
             )
-        let recent = recentHistory.suffix(8).map { item in
-            GeminiContent(
-                role: item.role == .user ? "user" : "model",
-                parts: [GeminiPart(text: item.text)]
+
+            let prompt = """
+            Article context:
+            Title: \(article.title)
+            Source: \(article.source.name)
+            Description: \(article.description ?? "N/A")
+            Content: \(article.content ?? "N/A")
+
+            User question: \(userMessage)
+            """
+
+            let response = try await session.respond(
+                to: prompt,
+                options: GenerationOptions(temperature: 0.2)
             )
+            let cleaned = normalizeReply(response.content)
+            return isLowQualityReply(cleaned) ? fallbackReply(article: article) : cleaned
         }
+        #endif
 
-        var contents = recent
-        contents.append(
-            GeminiContent(
-                role: "user",
-                parts: [GeminiPart(text: userMessage)]
-            )
-        )
-
-        let requestBody = GeminiGenerateRequest(
-            systemInstruction: GeminiContent(
-                role: "system",
-                parts: [GeminiPart(text: """
-                You are Layman, a concise AI that explains news in simple language.
-                Rules:
-                - Reply in 1-2 complete sentences.
-                - Do not use fragments, sentence starters, or bullet points.
-                - Keep the answer between 14 and 40 words.
-                - Keep it directly relevant to this article context: \(context)
-                """)]
-            ),
-            contents: contents,
-            generationConfig: GeminiGenerationConfig(
-                temperature: 0.4,
-                maxOutputTokens: 120
-            )
-        )
-
-        let decoded = try await performGenerate(requestBody: requestBody, apiKey: apiKey)
-        guard let rawText = extractText(from: decoded) else {
-            throw ChatError.emptyResponse
-        }
-
-        let cleanedText = normalizeReply(rawText)
-        if isLowQualityReply(cleanedText) {
-            let repaired = try await regenerateCleanReply(
-                userMessage: userMessage,
-                article: article,
-                draftReply: cleanedText,
-                apiKey: apiKey
-            )
-            if isLowQualityReply(repaired) {
-                return fallbackReply(article: article)
-            }
-            return repaired
-        }
-
-        return cleanedText
+        return fallbackReply(article: article)
     }
 
     func generateSuggestions(article: Article) async throws -> [String] {
-        let apiKey = try loadAPIKey()
-        let endpoint = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(apiKey)")!
-
-        let context = """
-        Title: \(article.title)
-        Source: \(article.source.name)
-        Description: \(article.description ?? "N/A")
-        Content: \(article.content ?? "N/A")
-        """
-
-        let requestBody = GeminiGenerateRequest(
-            systemInstruction: GeminiContent(
-                role: "system",
-                parts: [GeminiPart(text: "Generate exactly 3 short, specific user questions based on the article context. Questions must be practical, simple, and directly related to this article. Output only a JSON array of 3 strings, nothing else.")]
-            ),
-            contents: [
-                GeminiContent(
-                    role: "user",
-                    parts: [GeminiPart(text: context)]
-                )
-            ],
-            generationConfig: GeminiGenerationConfig(
-                temperature: 0.2,
-                maxOutputTokens: 140
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, macOS 26.0, visionOS 26.0, *), model.isAvailable {
+            let session = LanguageModelSession(
+                model: model,
+                instructions: "Generate exactly 3 short, practical user questions. Return only a JSON array of strings."
             )
-        )
 
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(requestBody)
+            let prompt = """
+            Article context:
+            Title: \(article.title)
+            Source: \(article.source.name)
+            Description: \(article.description ?? "N/A")
+            Content: \(article.content ?? "N/A")
+            """
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ChatError.invalidResponse
-        }
-
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "Unknown API error"
-            throw ChatError.apiFailure(message)
-        }
-
-        let decoded = try JSONDecoder().decode(GeminiGenerateResponse.self, from: data)
-        guard let text = extractText(from: decoded) else {
-            throw ChatError.emptyResponse
-        }
-
-        return parseSuggestionText(text)
-    }
-
-    private func loadAPIKey() throws -> String {
-        if let value = AppConfig.value(for: "GEMINI_API_KEY"),
-           !AppConfig.isUnresolvedBuildSetting(value) {
-            return value
-        }
-
-        throw ChatError.missingAPIKey
-    }
-
-    private func performGenerate(requestBody: GeminiGenerateRequest, apiKey: String) async throws -> GeminiGenerateResponse {
-        let endpoint = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(apiKey)")!
-
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(requestBody)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ChatError.invalidResponse
-        }
-
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "Unknown API error"
-            throw ChatError.apiFailure(message)
-        }
-
-        return try JSONDecoder().decode(GeminiGenerateResponse.self, from: data)
-    }
-
-    private func regenerateCleanReply(userMessage: String, article: Article, draftReply: String, apiKey: String) async throws -> String {
-        let repairRequest = GeminiGenerateRequest(
-            systemInstruction: GeminiContent(
-                role: "system",
-                parts: [GeminiPart(text: """
-                Rewrite the draft into a clear layman answer.
-                Must be 1-2 complete sentences, no fragments, no bullets.
-                Keep between 14 and 40 words.
-                Keep it grounded in the provided article context.
-                Return plain text only.
-                """)]
-            ),
-            contents: [
-                GeminiContent(
-                    role: "user",
-                    parts: [GeminiPart(text: """
-                    Article title: \(article.title)
-                    Article source: \(article.source.name)
-                    Article description: \(article.description ?? "N/A")
-                    Article content: \(article.content ?? "N/A")
-                    User question: \(userMessage)
-                    Draft answer: \(draftReply)
-                    """)]
-                )
-            ],
-            generationConfig: GeminiGenerationConfig(
-                temperature: 0.2,
-                maxOutputTokens: 120
+            let response = try await session.respond(
+                to: prompt,
+                options: GenerationOptions(temperature: 0.2)
             )
-        )
-
-        let decoded = try await performGenerate(requestBody: repairRequest, apiKey: apiKey)
-        guard
-            let repaired = extractText(from: decoded),
-            !repaired.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            throw ChatError.emptyResponse
+            let parsed = parseSuggestionText(response.content)
+            if !parsed.isEmpty {
+                return parsed
+            }
         }
+        #endif
 
-        return normalizeReply(repaired)
-    }
-
-    private func extractText(from response: GeminiGenerateResponse) -> String? {
-        let combined = response.candidates
-            .flatMap { $0.content.parts }
-            .compactMap(\.text)
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return combined.isEmpty ? nil : combined
+        return SuggestionBuilder.fallbackSuggestions(from: article)
     }
 
     private func normalizeReply(_ text: String) -> String {
@@ -574,62 +440,6 @@ private struct GeminiChatClient {
         guard lowercased != "json" else { return false }
         guard suggestion.count >= 6 else { return false }
         return suggestion.range(of: "[A-Za-z]", options: .regularExpression) != nil
-    }
-}
-
-private struct GeminiGenerateRequest: Encodable {
-    let systemInstruction: GeminiContent
-    let contents: [GeminiContent]
-    let generationConfig: GeminiGenerationConfig
-}
-
-private struct GeminiContent: Codable {
-    let role: String
-    let parts: [GeminiPart]
-}
-
-private struct GeminiPart: Codable {
-    let text: String
-}
-
-private struct GeminiGenerationConfig: Encodable {
-    let temperature: Double
-    let maxOutputTokens: Int
-}
-
-private struct GeminiGenerateResponse: Decodable {
-    let candidates: [GeminiCandidate]
-}
-
-private struct GeminiCandidate: Decodable {
-    let content: GeminiCandidateContent
-}
-
-private struct GeminiCandidateContent: Decodable {
-    let parts: [GeminiCandidatePart]
-}
-
-private struct GeminiCandidatePart: Decodable {
-    let text: String?
-}
-
-private enum ChatError: LocalizedError {
-    case missingAPIKey
-    case invalidResponse
-    case emptyResponse
-    case apiFailure(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .missingAPIKey:
-            return "Missing GEMINI_API_KEY. Add it in environment variables or Info.plist."
-        case .invalidResponse:
-            return "Invalid server response."
-        case .emptyResponse:
-            return "No response text received."
-        case .apiFailure(let message):
-            return "API error: \(message)"
-        }
     }
 }
 
